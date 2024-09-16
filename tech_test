@@ -1,103 +1,93 @@
 // tech_test.js
 
-// Importar el módulo HTTPS para hacer solicitudes HTTP
-const https = require('https');
-const AWS = require('aws-sdk');
-const dynamoDB = new AWS.DynamoDB.DocumentClient();
-const tableName = process.env.STORAGE_BITCOINBALANCES_NAME; // Nombre de la tabla DynamoDB
+import fetch from 'node-fetch';
+import { DynamoDBClient, PutItemCommand, QueryCommand } from '@aws-sdk/client-dynamodb';
 
-// Función Lambda para obtener el balance de una dirección  y calcular la variación
-exports.handler = async (event) => {
-    // Dirección de Bitcoin a consultar
-    const address = '32ixEdVJWo3kmvJGMTZq5jAQVZZeuwnqzo';
-    // URL del API de mempool.space
-    const url = `https://mempool.space/api/address/${address}`;
-    // Obtener el timestamp actual en formato UNIX
-    const timestamp = Math.floor(Date.now() / 1000);
+const dynamoDB = new DynamoDBClient({ region: 'us-east-1' });
+const BITCOIN_ADDRESS = '32ixEdVJWo3kmvJGMTZq5jAQVZZeuwnqzo';
 
-    return new Promise((resolve, reject) => {
-        // Hacer una solicitud HTTP GET al API
-        https.get(url, async (resp) => {
-            let data = '';
+export const handler = async (event) => {
+  try {
+    // Llamada a la API para obtener el balance de la dirección
+    const url = `https://mempool.space/api/address/${BITCOIN_ADDRESS}`;
+    const response = await fetch(url);
 
-            // Acumular los datos recibidos
-            resp.on('data', (chunk) => {
-                data += chunk;
-            });
-
-            // Procesar los datos cuando la respuesta esté completa
-            resp.on('end', async () => {
-                const balanceData = JSON.parse(data);
-                const confirmedBalance = balanceData.chain_stats.funded_txo_sum - balanceData.chain_stats.spent_txo_sum;
-                const mempoolBalance = balanceData.mempool_stats.funded_txo_sum - balanceData.mempool_stats.spent_txo_sum;
-
-                // Guardar balance en DynamoDB
-                const params = {
-                    TableName: tableName,
-                    Item: {
-                        address,
-                        timestamp,
-                        confirmedBalance,
-                        mempoolBalance
-                    }
-                };
-
-                try {
-                    await dynamoDB.put(params).promise();
-
-                    // Obtener variaciones de balance
-                    const balanceVariation7Days = await getBalanceVariation(address, 7);
-                    const balanceVariation30Days = await getBalanceVariation(address, 30);
-
-                    resolve({
-                        statusCode: 200,
-                        body: JSON.stringify({
-                            confirmedBalance,
-                            mempoolBalance,
-                            balanceVariation7Days,
-                            balanceVariation30Days
-                        })
-                    });
-                } catch (error) {
-                    reject({
-                        statusCode: 500,
-                        body: JSON.stringify({ error: error.message })
-                    });
-                }
-            });
-
-        }).on("error", (err) => {
-            // Manejar errores en la solicitud
-            reject({
-                statusCode: 500,
-                body: JSON.stringify({ error: err.message }),
-            });
-        });
-    });
-};
-
-// Función para calcular la variación del balance
-const getBalanceVariation = async (address, days) => {
-    const timeRange = Math.floor(Date.now() / 1000) - (days * 24 * 60 * 60); // Timestamp UNIX para los días atrás
-    const params = {
-        TableName: tableName,
-        KeyConditionExpression: 'address = :address AND timestamp >= :timeRange',
-        ExpressionAttributeValues: {
-            ':address': address,
-            ':timeRange': timeRange
-        }
-    };
-
-    try {
-        const result = await dynamoDB.query(params).promise();
-        if (result.Items.length > 0) {
-            const firstEntry = result.Items[0].confirmedBalance;
-            const lastEntry = result.Items[result.Items.length - 1].confirmedBalance;
-            return lastEntry - firstEntry; // Retornar la variación de balance en el período
-        }
-        return 0;
-    } catch (error) {
-        console.error("Error querying DynamoDB:", error);
-        return 0;
+    // Verificar si la respuesta es correcta
+    if (!response.ok) {
+      throw new Error(`Error fetching on-chain data: ${response.statusText}`);
     }
+
+    const data = await response.json();
+
+    // Obtener el balance confirmado y el balance del mempool
+    const onChainBalance = data.chain_stats.funded_txo_sum - data.chain_stats.spent_txo_sum;
+    const mempoolBalance = data.mempool_stats.funded_txo_sum - data.mempool_stats.spent_txo_sum;
+
+    // Guardar el balance actual en DynamoDB con timestamp
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    await saveBalanceToDynamoDB(onChainBalance, mempoolBalance, currentTimestamp);
+
+    // Cálculo de variación en periodos reales
+    const balanceLast30Days = await fetchBalanceVariation(30, currentTimestamp);
+    const balanceLast7Days = await fetchBalanceVariation(7, currentTimestamp);
+
+    return {
+      statusCode: 200,
+      body: JSON.stringify({
+        onChainBalance,
+        mempoolBalance,
+        balanceLast30Days,
+        balanceLast7Days,
+      }),
+    };
+  } catch (error) {
+    console.error('Error fetching balance data:', error);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ message: 'Error fetching data', error: error.message }),
+    };
+  }
 };
+
+// Función para guardar balance en DynamoDB
+async function saveBalanceToDynamoDB(onChainBalance, mempoolBalance, timestamp) {
+  const params = {
+    TableName: 'BitcoinBalanceHistory',
+    Item: {
+      address: { S: BITCOIN_ADDRESS },
+      timestamp: { N: timestamp.toString() },
+      onChainBalance: { N: onChainBalance.toString() },
+      mempoolBalance: { N: mempoolBalance.toString() }
+    }
+  };
+
+  await dynamoDB.send(new PutItemCommand(params));
+}
+
+// Función para calcular la variación de balance en los últimos 'days' días
+async function fetchBalanceVariation(days, currentTimestamp) {
+  const pastTimestamp = currentTimestamp - (days * 24 * 60 * 60);
+
+  const params = {
+    TableName: 'BitcoinBalanceHistory',
+    KeyConditionExpression: '#addr = :address AND #ts BETWEEN :pastTimestamp AND :currentTimestamp',
+    ExpressionAttributeNames: {
+      '#addr': 'address',
+      '#ts': 'timestamp',
+    },
+    ExpressionAttributeValues: {
+      ':address': { S: BITCOIN_ADDRESS },
+      ':pastTimestamp': { N: pastTimestamp.toString() },
+      ':currentTimestamp': { N: currentTimestamp.toString() },
+    }
+  };
+
+  const data = await dynamoDB.send(new QueryCommand(params));
+  if (data.Items.length > 0) {
+    const pastBalance = parseInt(data.Items[0].onChainBalance.N, 10);
+    const currentBalance = parseInt(data.Items[data.Items.length - 1].onChainBalance.N, 10);
+    return currentBalance - pastBalance;
+  } else {
+    return 0;
+  }
+}
